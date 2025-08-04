@@ -1,5 +1,7 @@
 import 'dart:convert';
+import 'dart:async';
 import 'dart:typed_data';
+import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_joystick/flutter_joystick.dart';
@@ -40,9 +42,12 @@ class _JoyPadState extends State<JoyPad> with TickerProviderStateMixin {
   bool isLed2On = false;
   bool isHornOn = false;
   double sliderValue = 0.0;
+  double temperature = 25.0; // Current temperature in Celsius
+  Timer? _temperatureTimer;
 
   late AnimationController _blinkController;
   late AnimationController _hornController;
+  late AnimationController _gaugeController;
 
   @override
   void initState() {
@@ -57,13 +62,59 @@ class _JoyPadState extends State<JoyPad> with TickerProviderStateMixin {
       vsync: this,
     );
 
+    _gaugeController = AnimationController(
+      duration: const Duration(milliseconds: 1500),
+      vsync: this,
+    );
+
     startScan();
+  }
+
+  // Start temperature monitoring when ESP32 is connected
+  void _startTemperatureMonitoring() {
+    _temperatureTimer?.cancel();
+    _temperatureTimer = Timer.periodic(Duration(minutes: 1), (timer) {
+      if (isConnected && targetCharacteristic != null) {
+        _requestTemperature();
+      } else {
+        timer.cancel();
+      }
+    });
+    // Request temperature immediately when connected
+    _requestTemperature();
+  }
+
+  // Stop temperature monitoring
+  void _stopTemperatureMonitoring() {
+    _temperatureTimer?.cancel();
+    _temperatureTimer = null;
+  }
+
+  // Request temperature from ESP32
+  void _requestTemperature() {
+    if (isConnected && targetCharacteristic != null) {
+      sendData("GET_TEMP");
+    }
+  }
+
+  // Handle incoming data from ESP32
+  void _handleIncomingData(String data) {
+    if (data.startsWith("TEMP:")) {
+      double receivedTemp = double.parse(data.substring(5));
+      setState(() {
+        temperature = receivedTemp;
+      });
+      _gaugeController.forward(from: 0);
+      print("Received temperature: ${receivedTemp}°C");
+    }
   }
 
   @override
   void dispose() {
+    _temperatureTimer?.cancel();
     _blinkController.dispose();
     _hornController.dispose();
+    _gaugeController.dispose();
     super.dispose();
   }
 
@@ -92,14 +143,38 @@ class _JoyPadState extends State<JoyPad> with TickerProviderStateMixin {
             targetCharacteristic = c;
             isConnected = true;
           });
+
+          // Set up notification listener for temperature data
+          if (c.properties.notify) {
+            await c.setNotifyValue(true);
+            c.value.listen((value) {
+              String data = String.fromCharCodes(value);
+              _handleIncomingTemp(data);
+            });
+          }
+
           sendData("CONNECTED");
+          _startTemperatureMonitoring();
           return;
         }
       }
     }
   }
 
+  // Handle incoming data from ESP32
+  void _handleIncomingTemp(String data) {
+    if (data.startsWith("TEMP:")) {
+      double receivedTemp = double.parse(data.substring(5));
+      setState(() {
+        temperature = receivedTemp;
+      });
+      _gaugeController.forward(from: 0);
+      print("Received temperature: ${receivedTemp}°C");
+    }
+  }
+
   void disconnect() async {
+    _stopTemperatureMonitoring(); // Stop temperature monitoring
     if (targetDevice != null) {
       await targetDevice!.disconnect();
       setState(() {
@@ -130,6 +205,101 @@ class _JoyPadState extends State<JoyPad> with TickerProviderStateMixin {
       direction = "STOP";
     }
     sendData(direction);
+  }
+
+  Color _getTemperatureColor(double temp) {
+    if (temp < 25) return Colors.blue[400]!;        // Cold
+    if (temp < 35) return Colors.cyan[400]!;        // Cool
+    if (temp < 45) return Colors.green[400]!;       // Normal
+    if (temp < 55) return Colors.orange[400]!;      // Warm
+    if (temp < 65) return Colors.red[400]!;         // Hot
+    return Colors.red[700]!;                        // Critical
+  }
+
+  String _getTemperatureStatus(double temp) {
+    if (temp < 25) return "COLD";
+    if (temp < 35) return "COOL";
+    if (temp < 45) return "NORMAL";
+    if (temp < 55) return "WARM";
+    if (temp < 65) return "HOT";
+    return "CRITICAL";
+  }
+
+  Widget buildTemperatureGauge() {
+    return Container(
+      width: 140,
+      height: 140,
+      child: Stack(
+        alignment: Alignment.center,
+        children: [
+          // Background circle
+          Container(
+            width: 130,
+            height: 130,
+            decoration: BoxDecoration(
+              shape: BoxShape.circle,
+              color: Colors.grey[900],
+              border: Border.all(color: Colors.grey[700]!, width: 2),
+            ),
+          ),
+          // Temperature arc
+          CustomPaint(
+            size: Size(120, 120),
+            painter: TemperatureGaugePainter(
+              temperature: temperature,
+              color: _getTemperatureColor(temperature),
+              animation: _gaugeController,
+            ),
+          ),
+          // Center content
+          Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(
+                "${temperature.toInt()}°C",
+                style: TextStyle(
+                  fontSize: 18,
+                  fontWeight: FontWeight.bold,
+                  color: _getTemperatureColor(temperature),
+                ),
+              ),
+              Text(
+                _getTemperatureStatus(temperature),
+                style: TextStyle(
+                  fontSize: 8,
+                  fontWeight: FontWeight.w500,
+                  color: Colors.grey[400],
+                ),
+              ),
+            ],
+          ),
+          // Temperature scale markers (20°C to 70°C)
+          ...List.generate(6, (index) {
+            double angle = -math.pi + (index * math.pi / 5);
+            double markerRadius = 55;
+            int tempValue = 20 + (index * 10); // 20, 30, 40, 50, 60, 70
+            return Positioned(
+              left: 70 + markerRadius * math.cos(angle) - 8,
+              top: 70 + markerRadius * math.sin(angle) - 8,
+              child: Container(
+                width: 16,
+                height: 16,
+                child: Center(
+                  child: Text(
+                    "$tempValue",
+                    style: TextStyle(
+                      fontSize: 8,
+                      color: Colors.grey[500],
+                      fontWeight: FontWeight.w500,
+                    ),
+                  ),
+                ),
+              ),
+            );
+          }),
+        ],
+      ),
+    );
   }
 
   Widget buildLedSwitch(String label, bool isOn, void Function(bool) onChanged) {
@@ -321,7 +491,7 @@ class _JoyPadState extends State<JoyPad> with TickerProviderStateMixin {
               ),
             ),
           ),
-          // New text on the left
+          // Existing text on the left
           Positioned(
             left: 30,
             top: 0,
@@ -357,8 +527,115 @@ class _JoyPadState extends State<JoyPad> with TickerProviderStateMixin {
               ),
             ),
           ),
+          // New temperature gauge on the right
+          Positioned(
+            right: 30,
+            top: 0,
+            bottom: 0,
+            child: Center(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(
+                    "Temperature",
+                    style: TextStyle(
+                      fontSize: 14,
+                      fontWeight: FontWeight.w500,
+                      color: Colors.grey[300],
+                    ),
+                  ),
+                  SizedBox(height: 8),
+                  buildTemperatureGauge(),
+                ],
+              ),
+            ),
+          ),
         ],
       ),
     );
   }
+}
+
+class TemperatureGaugePainter extends CustomPainter {
+  final double temperature;
+  final Color color;
+  final AnimationController animation;
+
+  TemperatureGaugePainter({
+    required this.temperature,
+    required this.color,
+    required this.animation,
+  });
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final center = Offset(size.width / 2, size.height / 2);
+    final radius = size.width / 2 - 10;
+
+    // Background arc
+    final backgroundPaint = Paint()
+      ..color = Colors.grey[800]!
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 8
+      ..strokeCap = StrokeCap.round;
+
+    canvas.drawArc(
+      Rect.fromCircle(center: center, radius: radius),
+      -math.pi,
+      math.pi,
+      false,
+      backgroundPaint,
+    );
+
+    // Temperature arc
+    final tempPaint = Paint()
+      ..shader = LinearGradient(
+        colors: [
+          color.withOpacity(0.3),
+          color,
+          color.withOpacity(0.8),
+        ],
+        stops: [0.0, 0.5, 1.0],
+      ).createShader(Rect.fromCircle(center: center, radius: radius))
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 8
+      ..strokeCap = StrokeCap.round;
+
+    // Calculate sweep angle based on temperature (20-70°C range)
+    double normalizedTemp = ((temperature.clamp(20, 70) - 20) / 50);
+    double sweepAngle = math.pi * normalizedTemp * animation.value;
+
+    canvas.drawArc(
+      Rect.fromCircle(center: center, radius: radius),
+      -math.pi,
+      sweepAngle,
+      false,
+      tempPaint,
+    );
+
+    // Draw needle
+    final needleAngle = -math.pi + (math.pi * normalizedTemp * animation.value);
+    final needleLength = radius - 15;
+    final needleEnd = Offset(
+      center.dx + needleLength * math.cos(needleAngle),
+      center.dy + needleLength * math.sin(needleAngle),
+    );
+
+    final needlePaint = Paint()
+      ..color = color
+      ..strokeWidth = 3
+      ..strokeCap = StrokeCap.round;
+
+    canvas.drawLine(center, needleEnd, needlePaint);
+
+    // Draw center dot
+    final centerPaint = Paint()
+      ..color = color
+      ..style = PaintingStyle.fill;
+
+    canvas.drawCircle(center, 4, centerPaint);
+  }
+
+  @override
+  bool shouldRepaint(covariant CustomPainter oldDelegate) => true;
 }

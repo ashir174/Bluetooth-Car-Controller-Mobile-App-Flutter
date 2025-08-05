@@ -44,22 +44,22 @@ class _JoyPadState extends State<JoyPad> with TickerProviderStateMixin {
   bool isHornOn = false;
   double sliderValue = 0.0;
 
-  // Temperature management
-  double temperature = 33.0;
-  double baselineTemp = 33.0;
+  // Temperature management - synced with ESP32
+  double temperature = 25.0; // Match ESP32 baseline
+  double baselineTemp = 25.0; // Match ESP32 starting temperature
   Timer? _temperatureUpdateTimer;
   Timer? _hardwareRequestTimer;
   DateTime _lastHardwareUpdate = DateTime.now();
   bool _isReceivingHardwareData = false;
 
-  // Temperature simulation
-  double _simulatedTemp = 33.0;
-  double _tempTrend = 0.0; // For smooth temperature changes
+  // Temperature simulation for when hardware unavailable
+  double _simulatedTemp = 25.0;
+  double _tempTrend = 0.0;
 
-  // Fallback mechanism
-  static const Duration _hardwareTimeout = Duration(seconds: 10);
-  static const Duration _updateInterval = Duration(milliseconds: 800);
-  static const Duration _hardwareRequestInterval = Duration(seconds: 3);
+  // Improved synchronization settings
+  static const Duration _hardwareTimeout = Duration(seconds: 6); // Reduced timeout
+  static const Duration _updateInterval = Duration(milliseconds: 500); // Faster UI updates
+  static const Duration _hardwareRequestInterval = Duration(seconds: 3); // Reduced requests to match ESP32
 
   late AnimationController _blinkController;
   late AnimationController _hornController;
@@ -93,19 +93,18 @@ class _JoyPadState extends State<JoyPad> with TickerProviderStateMixin {
   }
 
   void _startTemperatureSystem() {
-    print("Starting temperature management system");
+    print("🌡️ Starting temperature management system");
 
-    // Main temperature update loop - runs continuously
+    // Main temperature update loop - runs continuously for smooth UI
     _temperatureUpdateTimer = Timer.periodic(_updateInterval, (timer) {
       if (!mounted) {
         timer.cancel();
         return;
       }
-
       _updateTemperature();
     });
 
-    // Hardware request timer - only when connected
+    // Hardware request timer - synced with ESP32 sending frequency
     _startHardwareRequestTimer();
   }
 
@@ -118,7 +117,10 @@ class _JoyPadState extends State<JoyPad> with TickerProviderStateMixin {
       }
 
       if (isConnected && targetCharacteristic != null) {
-        _requestTemperatureFromHardware();
+        // Only request if we haven't received data recently
+        if (!_isHardwareDataRecent()) {
+          _requestTemperatureFromHardware();
+        }
         _checkHardwareTimeout();
       }
     });
@@ -131,45 +133,43 @@ class _JoyPadState extends State<JoyPad> with TickerProviderStateMixin {
       // Use hardware data when available and recent
       newTemp = temperature; // Keep current hardware value
     } else {
-      // Generate simulated temperature
+      // Generate simulated temperature matching ESP32 range
       newTemp = _generateSimulatedTemperature();
       _isReceivingHardwareData = false;
     }
 
-    // Smooth temperature transitions
+    // Smooth temperature transitions for better UX
     if ((newTemp - temperature).abs() > 0.1) {
       setState(() {
         temperature = _smoothTemperatureTransition(temperature, newTemp);
       });
-
-      // Animate gauge
       _animateGauge();
     }
   }
 
   double _generateSimulatedTemperature() {
-    // Realistic temperature simulation with smooth changes
+    // Match ESP32 temperature range exactly (20-34°C)
     double targetTemp = baselineTemp;
 
-    // Add some random variation to target
+    // Add random variation to target
     if (math.Random().nextInt(50) == 0) {
-      _tempTrend = (math.Random().nextDouble() - 0.5) * 2.0; // ±1°C trend
+      _tempTrend = (math.Random().nextDouble() - 0.5) * 1.0; // ±0.5°C trend
     }
 
     // Apply trend and small random variations
     targetTemp += _tempTrend;
-    targetTemp += (math.Random().nextDouble() - 0.5) * 0.3; // ±0.15°C noise
+    targetTemp += (math.Random().nextDouble() - 0.5) * 0.2; // ±0.1°C noise
 
     // Gradually decay trend
     _tempTrend *= 0.98;
 
-    // Keep within realistic bounds
-    targetTemp = targetTemp.clamp(20.0, 65.0);
+    // Keep within ESP32 hardware range (20-34°C) - exact match
+    targetTemp = targetTemp.clamp(20.0, 34.0);
 
-    // Occasional larger variations (system events)
+    // Occasional variations within ESP32 range
     if (math.Random().nextInt(100) == 0) {
-      targetTemp += (math.Random().nextDouble() - 0.5) * 8.0; // ±4°C spike
-      targetTemp = targetTemp.clamp(15.0, 70.0);
+      targetTemp += (math.Random().nextDouble() - 0.5) * 4.0; // ±2°C spike
+      targetTemp = targetTemp.clamp(20.0, 34.0);
     }
 
     return targetTemp;
@@ -177,7 +177,7 @@ class _JoyPadState extends State<JoyPad> with TickerProviderStateMixin {
 
   double _smoothTemperatureTransition(double current, double target) {
     double diff = target - current;
-    double maxChange = 0.2; // Maximum change per update for smooth animation
+    double maxChange = 0.15; // Slightly faster for better sync
 
     if (diff.abs() <= maxChange) {
       return target;
@@ -190,9 +190,9 @@ class _JoyPadState extends State<JoyPad> with TickerProviderStateMixin {
     if (isConnected && targetCharacteristic != null) {
       try {
         sendData("GET_TEMP");
-        print("Temperature requested from ESP32");
+        print("🔄 Temperature requested from ESP32");
       } catch (e) {
-        print("Error requesting temperature: $e");
+        print("❌ Error requesting temperature: $e");
       }
     }
   }
@@ -200,7 +200,7 @@ class _JoyPadState extends State<JoyPad> with TickerProviderStateMixin {
   void _checkHardwareTimeout() {
     if (_isReceivingHardwareData &&
         DateTime.now().difference(_lastHardwareUpdate) > _hardwareTimeout) {
-      print("Hardware temperature timeout - switching to simulation");
+      print("⏰ Hardware temperature timeout - switching to simulation");
       _isReceivingHardwareData = false;
     }
   }
@@ -217,37 +217,41 @@ class _JoyPadState extends State<JoyPad> with TickerProviderStateMixin {
   }
 
   void _handleIncomingData(String data) {
-    print("Processing data: $data");
+    print("📨 Processing data: $data");
 
     if (data.startsWith("TEMP:")) {
       try {
         String tempString = data.substring(5).trim();
         double receivedTemp = double.parse(tempString);
 
-        // Validate temperature range
-        if (receivedTemp >= 0 && receivedTemp <= 100) {
+        // Validate temperature range - ESP32 sends 20-34°C
+        if (receivedTemp >= 15.0 && receivedTemp <= 40.0) {
+          print("✅ Valid hardware temperature received: ${receivedTemp.toStringAsFixed(1)}°C");
+
           setState(() {
             temperature = receivedTemp;
-            baselineTemp = receivedTemp; // Update baseline for simulation
+            baselineTemp = receivedTemp; // Update baseline for simulation fallback
           });
 
           _isReceivingHardwareData = true;
           _lastHardwareUpdate = DateTime.now();
           _animateGauge();
 
-          print("Hardware temperature: ${receivedTemp.toStringAsFixed(1)}°C");
+          print("🌡️ Hardware temperature updated: ${receivedTemp.toStringAsFixed(1)}°C");
         } else {
-          print("Invalid temperature value received: $receivedTemp");
+          print("❌ Invalid temperature value received: $receivedTemp (out of range)");
         }
       } catch (e) {
-        print("Error parsing temperature: $e");
+        print("❌ Error parsing temperature: $e");
       }
+    } else {
+      print("📡 Other data received: $data");
     }
   }
 
   @override
   void dispose() {
-    print("Disposing temperature system");
+    print("🧹 Disposing temperature system");
     _temperatureUpdateTimer?.cancel();
     _hardwareRequestTimer?.cancel();
     _blinkController.dispose();
@@ -258,10 +262,12 @@ class _JoyPadState extends State<JoyPad> with TickerProviderStateMixin {
 
   void startScan() async {
     setState(() => isConnected = false);
+    print("🔍 Starting BLE scan...");
     FlutterBluePlus.startScan(timeout: const Duration(seconds: 5));
     FlutterBluePlus.scanResults.listen((results) async {
       for (ScanResult r in results) {
         if (r.device.name.contains(targetDeviceName)) {
+          print("📱 Found ESP32: ${r.device.name}");
           FlutterBluePlus.stopScan();
           await connectToDevice(r.device);
           break;
@@ -272,6 +278,7 @@ class _JoyPadState extends State<JoyPad> with TickerProviderStateMixin {
 
   Future<void> connectToDevice(BluetoothDevice device) async {
     try {
+      print("🔌 Connecting to ESP32...");
       await device.connect();
       List<BluetoothService> services = await device.discoverServices();
 
@@ -294,29 +301,32 @@ class _JoyPadState extends State<JoyPad> with TickerProviderStateMixin {
                     _handleIncomingData(data);
                   }
                 });
-                print("Notifications enabled");
+                print("🔔 Notifications enabled");
               } catch (e) {
-                print("Error enabling notifications: $e");
+                print("❌ Error enabling notifications: $e");
               }
             }
 
             sendData("CONNECTED");
 
-            // Start hardware requests
+            // Start hardware requests immediately after connection
             _startHardwareRequestTimer();
 
-            // Request initial temperature
-            Future.delayed(Duration(milliseconds: 500), () {
-              _requestTemperatureFromHardware();
+            // Request initial temperature after connection
+            Future.delayed(Duration(milliseconds: 1000), () {
+              if (mounted && isConnected) {
+                print("🔄 Requesting initial temperature...");
+                _requestTemperatureFromHardware();
+              }
             });
 
-            print("Connected to ESP32");
+            print("✅ Connected to ESP32 successfully");
             return;
           }
         }
       }
     } catch (e) {
-      print("Connection error: $e");
+      print("❌ Connection error: $e");
       setState(() {
         isConnected = false;
         targetDevice = null;
@@ -331,7 +341,7 @@ class _JoyPadState extends State<JoyPad> with TickerProviderStateMixin {
       try {
         await targetDevice!.disconnect();
       } catch (e) {
-        print("Disconnect error: $e");
+        print("❌ Disconnect error: $e");
       }
 
       setState(() {
@@ -342,7 +352,7 @@ class _JoyPadState extends State<JoyPad> with TickerProviderStateMixin {
       });
 
       _hardwareRequestTimer?.cancel();
-      print("Disconnected from ESP32");
+      print("🔌 Disconnected from ESP32");
     }
   }
 
@@ -351,9 +361,9 @@ class _JoyPadState extends State<JoyPad> with TickerProviderStateMixin {
       try {
         List<int> bytes = utf8.encode("$data\n");
         targetCharacteristic!.write(bytes, withoutResponse: false);
-        print("Sent: $data");
+        print("📤 Sent: $data");
       } catch (e) {
-        print("Send error: $e");
+        print("❌ Send error: $e");
       }
     }
   }
@@ -375,20 +385,20 @@ class _JoyPadState extends State<JoyPad> with TickerProviderStateMixin {
   }
 
   Color _getTemperatureColor(double temp) {
-    if (temp < 25) return Colors.blue[400]!;
-    if (temp < 35) return Colors.cyan[400]!;
-    if (temp < 45) return Colors.green[400]!;
-    if (temp < 55) return Colors.orange[400]!;
-    if (temp < 65) return Colors.red[400]!;
+    if (temp < 22) return Colors.blue[400]!;
+    if (temp < 26) return Colors.cyan[400]!;
+    if (temp < 30) return Colors.green[400]!;
+    if (temp < 32) return Colors.orange[400]!;
+    if (temp < 34) return Colors.red[400]!;
     return Colors.red[700]!;
   }
 
   String _getTemperatureStatus(double temp) {
-    if (temp < 25) return "COLD";
-    if (temp < 35) return "COOL";
-    if (temp < 45) return "NORMAL";
-    if (temp < 55) return "WARM";
-    if (temp < 65) return "HOT";
+    if (temp < 22) return "COLD";
+    if (temp < 26) return "COOL";
+    if (temp < 30) return "NORMAL";
+    if (temp < 32) return "WARM";
+    if (temp < 34) return "HOT";
     return "CRITICAL";
   }
 
@@ -472,11 +482,11 @@ class _JoyPadState extends State<JoyPad> with TickerProviderStateMixin {
               ),
             ],
           ),
-          // Temperature scale markers
-          ...List.generate(6, (index) {
-            double angle = -math.pi + (index * math.pi / 5);
+          // Temperature scale markers adjusted for 20-34°C range
+          ...List.generate(5, (index) {
+            double angle = -math.pi + (index * math.pi / 4);
             double markerRadius = 55;
-            int tempValue = 20 + (index * 10);
+            int tempValue = 20 + (index * 4); // 20, 24, 28, 32, 36
             return Positioned(
               left: 70 + markerRadius * math.cos(angle) - 8,
               top: 70 + markerRadius * math.sin(angle) - 8,
@@ -798,8 +808,8 @@ class TemperatureGaugePainter extends CustomPainter {
       ..strokeWidth = 8
       ..strokeCap = StrokeCap.round;
 
-    // Calculate sweep angle based on temperature (20-70°C range)
-    double normalizedTemp = ((temperature.clamp(20, 70) - 20) / 50);
+    // Calculate sweep angle based on temperature (20-34°C range - matches ESP32)
+    double normalizedTemp = ((temperature.clamp(20, 34) - 20) / 14); // 14°C range
     double sweepAngle = math.pi * normalizedTemp * animationValue;
 
     canvas.drawArc(

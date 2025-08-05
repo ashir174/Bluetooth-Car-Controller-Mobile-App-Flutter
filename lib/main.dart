@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'dart:async';
 import 'dart:typed_data';
 import 'dart:math' as math;
+import 'dart:collection';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_joystick/flutter_joystick.dart';
@@ -42,8 +43,23 @@ class _JoyPadState extends State<JoyPad> with TickerProviderStateMixin {
   bool isLed2On = false;
   bool isHornOn = false;
   double sliderValue = 0.0;
-  double temperature = 25.0; // Current temperature in Celsius
-  Timer? _temperatureTimer;
+
+  // Temperature management
+  double temperature = 33.0;
+  double baselineTemp = 33.0;
+  Timer? _temperatureUpdateTimer;
+  Timer? _hardwareRequestTimer;
+  DateTime _lastHardwareUpdate = DateTime.now();
+  bool _isReceivingHardwareData = false;
+
+  // Temperature simulation
+  double _simulatedTemp = 33.0;
+  double _tempTrend = 0.0; // For smooth temperature changes
+
+  // Fallback mechanism
+  static const Duration _hardwareTimeout = Duration(seconds: 10);
+  static const Duration _updateInterval = Duration(milliseconds: 800);
+  static const Duration _hardwareRequestInterval = Duration(seconds: 3);
 
   late AnimationController _blinkController;
   late AnimationController _hornController;
@@ -52,66 +68,188 @@ class _JoyPadState extends State<JoyPad> with TickerProviderStateMixin {
   @override
   void initState() {
     super.initState();
+    _initializeAnimations();
+    _startTemperatureSystem();
+    startScan();
+  }
+
+  void _initializeAnimations() {
     _blinkController = AnimationController(
-      duration: const Duration(milliseconds: 800),
+      duration: const Duration(milliseconds: 400),
       vsync: this,
     )..repeat(reverse: true);
 
     _hornController = AnimationController(
-      duration: const Duration(milliseconds: 200),
+      duration: const Duration(milliseconds: 100),
       vsync: this,
     );
 
     _gaugeController = AnimationController(
-      duration: const Duration(milliseconds: 1500),
+      duration: const Duration(milliseconds: 750),
       vsync: this,
     );
 
-    startScan();
+    _gaugeController.forward();
   }
 
-  // Start temperature monitoring when ESP32 is connected
-  void _startTemperatureMonitoring() {
-    _temperatureTimer?.cancel();
-    _temperatureTimer = Timer.periodic(Duration(minutes: 1), (timer) {
-      if (isConnected && targetCharacteristic != null) {
-        _requestTemperature();
-      } else {
+  void _startTemperatureSystem() {
+    print("Starting temperature management system");
+
+    // Main temperature update loop - runs continuously
+    _temperatureUpdateTimer = Timer.periodic(_updateInterval, (timer) {
+      if (!mounted) {
         timer.cancel();
+        return;
+      }
+
+      _updateTemperature();
+    });
+
+    // Hardware request timer - only when connected
+    _startHardwareRequestTimer();
+  }
+
+  void _startHardwareRequestTimer() {
+    _hardwareRequestTimer?.cancel();
+    _hardwareRequestTimer = Timer.periodic(_hardwareRequestInterval, (timer) {
+      if (!mounted) {
+        timer.cancel();
+        return;
+      }
+
+      if (isConnected && targetCharacteristic != null) {
+        _requestTemperatureFromHardware();
+        _checkHardwareTimeout();
       }
     });
-    // Request temperature immediately when connected
-    _requestTemperature();
   }
 
-  // Stop temperature monitoring
-  void _stopTemperatureMonitoring() {
-    _temperatureTimer?.cancel();
-    _temperatureTimer = null;
-  }
+  void _updateTemperature() {
+    double newTemp;
 
-  // Request temperature from ESP32
-  void _requestTemperature() {
-    if (isConnected && targetCharacteristic != null) {
-      sendData("GET_TEMP");
+    if (_isReceivingHardwareData && _isHardwareDataRecent()) {
+      // Use hardware data when available and recent
+      newTemp = temperature; // Keep current hardware value
+    } else {
+      // Generate simulated temperature
+      newTemp = _generateSimulatedTemperature();
+      _isReceivingHardwareData = false;
+    }
+
+    // Smooth temperature transitions
+    if ((newTemp - temperature).abs() > 0.1) {
+      setState(() {
+        temperature = _smoothTemperatureTransition(temperature, newTemp);
+      });
+
+      // Animate gauge
+      _animateGauge();
     }
   }
 
-  // Handle incoming data from ESP32
+  double _generateSimulatedTemperature() {
+    // Realistic temperature simulation with smooth changes
+    double targetTemp = baselineTemp;
+
+    // Add some random variation to target
+    if (math.Random().nextInt(50) == 0) {
+      _tempTrend = (math.Random().nextDouble() - 0.5) * 2.0; // ±1°C trend
+    }
+
+    // Apply trend and small random variations
+    targetTemp += _tempTrend;
+    targetTemp += (math.Random().nextDouble() - 0.5) * 0.3; // ±0.15°C noise
+
+    // Gradually decay trend
+    _tempTrend *= 0.98;
+
+    // Keep within realistic bounds
+    targetTemp = targetTemp.clamp(20.0, 65.0);
+
+    // Occasional larger variations (system events)
+    if (math.Random().nextInt(100) == 0) {
+      targetTemp += (math.Random().nextDouble() - 0.5) * 8.0; // ±4°C spike
+      targetTemp = targetTemp.clamp(15.0, 70.0);
+    }
+
+    return targetTemp;
+  }
+
+  double _smoothTemperatureTransition(double current, double target) {
+    double diff = target - current;
+    double maxChange = 0.2; // Maximum change per update for smooth animation
+
+    if (diff.abs() <= maxChange) {
+      return target;
+    } else {
+      return current + (diff > 0 ? maxChange : -maxChange);
+    }
+  }
+
+  void _requestTemperatureFromHardware() {
+    if (isConnected && targetCharacteristic != null) {
+      try {
+        sendData("GET_TEMP");
+        print("Temperature requested from ESP32");
+      } catch (e) {
+        print("Error requesting temperature: $e");
+      }
+    }
+  }
+
+  void _checkHardwareTimeout() {
+    if (_isReceivingHardwareData &&
+        DateTime.now().difference(_lastHardwareUpdate) > _hardwareTimeout) {
+      print("Hardware temperature timeout - switching to simulation");
+      _isReceivingHardwareData = false;
+    }
+  }
+
+  bool _isHardwareDataRecent() {
+    return DateTime.now().difference(_lastHardwareUpdate) < _hardwareTimeout;
+  }
+
+  void _animateGauge() {
+    if (_gaugeController.isCompleted || _gaugeController.isDismissed) {
+      _gaugeController.reset();
+      _gaugeController.forward();
+    }
+  }
+
   void _handleIncomingData(String data) {
+    print("Processing data: $data");
+
     if (data.startsWith("TEMP:")) {
-      double receivedTemp = double.parse(data.substring(5));
-      setState(() {
-        temperature = receivedTemp;
-      });
-      _gaugeController.forward(from: 0);
-      print("Received temperature: ${receivedTemp}°C");
+      try {
+        String tempString = data.substring(5).trim();
+        double receivedTemp = double.parse(tempString);
+
+        // Validate temperature range
+        if (receivedTemp >= 0 && receivedTemp <= 100) {
+          setState(() {
+            temperature = receivedTemp;
+            baselineTemp = receivedTemp; // Update baseline for simulation
+          });
+
+          _isReceivingHardwareData = true;
+          _lastHardwareUpdate = DateTime.now();
+          _animateGauge();
+
+          print("Hardware temperature: ${receivedTemp.toStringAsFixed(1)}°C");
+        } else {
+          print("Invalid temperature value received: $receivedTemp");
+        }
+      } catch (e) {
+        print("Error parsing temperature: $e");
+      }
     }
   }
 
   @override
   void dispose() {
-    _temperatureTimer?.cancel();
+    print("Disposing temperature system");
+    _temperatureUpdateTimer?.cancel();
+    _hardwareRequestTimer?.cancel();
     _blinkController.dispose();
     _hornController.dispose();
     _gaugeController.dispose();
@@ -133,61 +271,90 @@ class _JoyPadState extends State<JoyPad> with TickerProviderStateMixin {
   }
 
   Future<void> connectToDevice(BluetoothDevice device) async {
-    await device.connect();
-    List<BluetoothService> services = await device.discoverServices();
-    for (var service in services) {
-      for (var c in service.characteristics) {
-        if (c.properties.write) {
-          setState(() {
-            targetDevice = device;
-            targetCharacteristic = c;
-            isConnected = true;
-          });
+    try {
+      await device.connect();
+      List<BluetoothService> services = await device.discoverServices();
 
-          // Set up notification listener for temperature data
-          if (c.properties.notify) {
-            await c.setNotifyValue(true);
-            c.value.listen((value) {
-              String data = String.fromCharCodes(value);
-              _handleIncomingTemp(data);
+      for (var service in services) {
+        for (var c in service.characteristics) {
+          if (c.properties.write) {
+            setState(() {
+              targetDevice = device;
+              targetCharacteristic = c;
+              isConnected = true;
             });
-          }
 
-          sendData("CONNECTED");
-          _startTemperatureMonitoring();
-          return;
+            // Set up notification listener
+            if (c.properties.notify) {
+              try {
+                await c.setNotifyValue(true);
+                c.value.listen((value) {
+                  if (value.isNotEmpty) {
+                    String data = String.fromCharCodes(value).trim();
+                    _handleIncomingData(data);
+                  }
+                });
+                print("Notifications enabled");
+              } catch (e) {
+                print("Error enabling notifications: $e");
+              }
+            }
+
+            sendData("CONNECTED");
+
+            // Start hardware requests
+            _startHardwareRequestTimer();
+
+            // Request initial temperature
+            Future.delayed(Duration(milliseconds: 500), () {
+              _requestTemperatureFromHardware();
+            });
+
+            print("Connected to ESP32");
+            return;
+          }
         }
       }
-    }
-  }
-
-  // Handle incoming data from ESP32
-  void _handleIncomingTemp(String data) {
-    if (data.startsWith("TEMP:")) {
-      double receivedTemp = double.parse(data.substring(5));
+    } catch (e) {
+      print("Connection error: $e");
       setState(() {
-        temperature = receivedTemp;
+        isConnected = false;
+        targetDevice = null;
+        targetCharacteristic = null;
+        _isReceivingHardwareData = false;
       });
-      _gaugeController.forward(from: 0);
-      print("Received temperature: ${receivedTemp}°C");
     }
   }
 
   void disconnect() async {
-    _stopTemperatureMonitoring(); // Stop temperature monitoring
     if (targetDevice != null) {
-      await targetDevice!.disconnect();
+      try {
+        await targetDevice!.disconnect();
+      } catch (e) {
+        print("Disconnect error: $e");
+      }
+
       setState(() {
         targetDevice = null;
         targetCharacteristic = null;
         isConnected = false;
+        _isReceivingHardwareData = false;
       });
+
+      _hardwareRequestTimer?.cancel();
+      print("Disconnected from ESP32");
     }
   }
 
   void sendData(String data) {
-    if (targetCharacteristic != null) {
-      targetCharacteristic!.write(utf8.encode("$data\n"));
+    if (targetCharacteristic != null && isConnected) {
+      try {
+        List<int> bytes = utf8.encode("$data\n");
+        targetCharacteristic!.write(bytes, withoutResponse: false);
+        print("Sent: $data");
+      } catch (e) {
+        print("Send error: $e");
+      }
     }
   }
 
@@ -208,12 +375,12 @@ class _JoyPadState extends State<JoyPad> with TickerProviderStateMixin {
   }
 
   Color _getTemperatureColor(double temp) {
-    if (temp < 25) return Colors.blue[400]!;        // Cold
-    if (temp < 35) return Colors.cyan[400]!;        // Cool
-    if (temp < 45) return Colors.green[400]!;       // Normal
-    if (temp < 55) return Colors.orange[400]!;      // Warm
-    if (temp < 65) return Colors.red[400]!;         // Hot
-    return Colors.red[700]!;                        // Critical
+    if (temp < 25) return Colors.blue[400]!;
+    if (temp < 35) return Colors.cyan[400]!;
+    if (temp < 45) return Colors.green[400]!;
+    if (temp < 55) return Colors.orange[400]!;
+    if (temp < 65) return Colors.red[400]!;
+    return Colors.red[700]!;
   }
 
   String _getTemperatureStatus(double temp) {
@@ -243,20 +410,25 @@ class _JoyPadState extends State<JoyPad> with TickerProviderStateMixin {
             ),
           ),
           // Temperature arc
-          CustomPaint(
-            size: Size(120, 120),
-            painter: TemperatureGaugePainter(
-              temperature: temperature,
-              color: _getTemperatureColor(temperature),
-              animation: _gaugeController,
-            ),
+          AnimatedBuilder(
+            animation: _gaugeController,
+            builder: (context, child) {
+              return CustomPaint(
+                size: Size(120, 120),
+                painter: TemperatureGaugePainter(
+                  temperature: temperature,
+                  color: _getTemperatureColor(temperature),
+                  animationValue: _gaugeController.value,
+                ),
+              );
+            },
           ),
           // Center content
           Column(
             mainAxisSize: MainAxisSize.min,
             children: [
               Text(
-                "${temperature.toInt()}°C",
+                "${temperature.toStringAsFixed(1)}°C",
                 style: TextStyle(
                   fontSize: 18,
                   fontWeight: FontWeight.bold,
@@ -271,13 +443,40 @@ class _JoyPadState extends State<JoyPad> with TickerProviderStateMixin {
                   color: Colors.grey[400],
                 ),
               ),
+              // Status indicator
+              Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Container(
+                    width: 6,
+                    height: 6,
+                    decoration: BoxDecoration(
+                      shape: BoxShape.circle,
+                      color: _isReceivingHardwareData
+                          ? Colors.green[400]
+                          : Colors.orange[400],
+                    ),
+                  ),
+                  SizedBox(width: 4),
+                  Text(
+                    _isReceivingHardwareData ? "HW" : "SIM",
+                    style: TextStyle(
+                      fontSize: 6,
+                      fontWeight: FontWeight.w600,
+                      color: _isReceivingHardwareData
+                          ? Colors.green[400]
+                          : Colors.orange[400],
+                    ),
+                  ),
+                ],
+              ),
             ],
           ),
-          // Temperature scale markers (20°C to 70°C)
+          // Temperature scale markers
           ...List.generate(6, (index) {
             double angle = -math.pi + (index * math.pi / 5);
             double markerRadius = 55;
-            int tempValue = 20 + (index * 10); // 20, 30, 40, 50, 60, 70
+            int tempValue = 20 + (index * 10);
             return Positioned(
               left: 70 + markerRadius * math.cos(angle) - 8,
               top: 70 + markerRadius * math.sin(angle) - 8,
@@ -481,7 +680,6 @@ class _JoyPadState extends State<JoyPad> with TickerProviderStateMixin {
       ),
       body: Stack(
         children: [
-          // Existing centered joystick
           Center(
             child: Padding(
               padding: const EdgeInsets.all(20.0),
@@ -491,7 +689,6 @@ class _JoyPadState extends State<JoyPad> with TickerProviderStateMixin {
               ),
             ),
           ),
-          // Existing text on the left
           Positioned(
             left: 30,
             top: 0,
@@ -527,7 +724,6 @@ class _JoyPadState extends State<JoyPad> with TickerProviderStateMixin {
               ),
             ),
           ),
-          // New temperature gauge on the right
           Positioned(
             right: 30,
             top: 0,
@@ -546,6 +742,7 @@ class _JoyPadState extends State<JoyPad> with TickerProviderStateMixin {
                   ),
                   SizedBox(height: 8),
                   buildTemperatureGauge(),
+                  SizedBox(height: 8),
                 ],
               ),
             ),
@@ -559,12 +756,12 @@ class _JoyPadState extends State<JoyPad> with TickerProviderStateMixin {
 class TemperatureGaugePainter extends CustomPainter {
   final double temperature;
   final Color color;
-  final AnimationController animation;
+  final double animationValue;
 
   TemperatureGaugePainter({
     required this.temperature,
     required this.color,
-    required this.animation,
+    required this.animationValue,
   });
 
   @override
@@ -603,7 +800,7 @@ class TemperatureGaugePainter extends CustomPainter {
 
     // Calculate sweep angle based on temperature (20-70°C range)
     double normalizedTemp = ((temperature.clamp(20, 70) - 20) / 50);
-    double sweepAngle = math.pi * normalizedTemp * animation.value;
+    double sweepAngle = math.pi * normalizedTemp * animationValue;
 
     canvas.drawArc(
       Rect.fromCircle(center: center, radius: radius),
@@ -614,7 +811,7 @@ class TemperatureGaugePainter extends CustomPainter {
     );
 
     // Draw needle
-    final needleAngle = -math.pi + (math.pi * normalizedTemp * animation.value);
+    final needleAngle = -math.pi + (math.pi * normalizedTemp * animationValue);
     final needleLength = radius - 15;
     final needleEnd = Offset(
       center.dx + needleLength * math.cos(needleAngle),

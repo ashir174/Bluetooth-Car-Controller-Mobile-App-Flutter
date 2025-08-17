@@ -79,3 +79,8 @@ Enable Wi-Fi control for longer range
 Add AI-based obstacle detection
 
 ✨ This project demonstrates the integration of Flutter mobile apps, Firebase cloud services, and ESP32 hardware programming to create a functional IoT-based smart car controller.
+
+# View Project
+
+![WhatsApp Image 2025-08-17 at 22 02 17_f968e0ca](https://github.com/user-attachments/assets/ca3ea160-a84e-472e-a329-22f49091f51c)
+
